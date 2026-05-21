@@ -2,7 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Initialize Firebase Admin (already set up)
+// Initialize Firebase Admin
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.applicationDefault(),
@@ -28,7 +27,14 @@ app.get('/', (req, res) => {
 });
 
 // ============================================================
-// VERIFY PAYMENT - SECURE (uses Paystack Secret Key)
+// TEST ENDPOINT
+// ============================================================
+app.get('/api/test', (req, res) => {
+  res.json({ message: 'API is working!' });
+});
+
+// ============================================================
+// VERIFY PAYMENT
 // ============================================================
 app.post('/api/verify-payment', async (req, res) => {
   try {
@@ -38,7 +44,6 @@ app.post('/api/verify-payment', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     
-    // Verify with Paystack API using SECRET KEY from environment
     const response = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
       headers: {
         'Authorization': `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
@@ -52,7 +57,6 @@ app.post('/api/verify-payment', async (req, res) => {
       return res.status(400).json({ error: 'Payment verification failed' });
     }
     
-    // Payment is valid - update Firestore
     const expiryTime = admin.firestore.Timestamp.fromMillis(Date.now() + (24 * 60 * 60 * 1000));
     
     await db.collection('users').doc(userId).update({
@@ -65,7 +69,6 @@ app.post('/api/verify-payment', async (req, res) => {
       'updatedAt': admin.firestore.FieldValue.serverTimestamp()
     });
     
-    // Also save payment record
     await db.collection('payments').add({
       userId: userId,
       email: email,
@@ -142,17 +145,14 @@ app.post('/api/start-trial', async (req, res) => {
     const userData = userDoc.data();
     const now = admin.firestore.Timestamp.now();
     
-    // Check if already has active premium
     if (userData.subscription?.hasPaid && userData.subscription.expiryTime?.toMillis() > Date.now()) {
       return res.json({ success: true, message: 'Premium already active', trialActive: false });
     }
     
-    // Check if trial available
     const lastReset = userData.trial?.lastTrialReset?.toMillis() || 0;
     const hoursSinceReset = (Date.now() - lastReset) / (1000 * 60 * 60);
     
     if (hoursSinceReset >= 24) {
-      // New trial available
       const trialEndTime = admin.firestore.Timestamp.fromMillis(Date.now() + (15 * 60 * 1000));
       
       await db.collection('users').doc(userId).update({
@@ -165,10 +165,8 @@ app.post('/api/start-trial', async (req, res) => {
       
       res.json({ success: true, trialActive: true, trialExpiryTime: trialEndTime.toMillis() });
     } else if (userData.trial?.trialActive && userData.trial.trialEndTime?.toMillis() > Date.now()) {
-      // Trial still active
       res.json({ success: true, trialActive: true, trialExpiryTime: userData.trial.trialEndTime.toMillis() });
     } else {
-      // No trial available
       res.json({ success: false, trialActive: false, message: 'No trial available. Please upgrade.' });
     }
     
@@ -179,7 +177,7 @@ app.post('/api/start-trial', async (req, res) => {
 });
 
 // ============================================================
-// SAVE PROGRESS (with subscription check)
+// SAVE PROGRESS
 // ============================================================
 app.post('/api/save-progress', async (req, res) => {
   try {
@@ -189,7 +187,6 @@ app.post('/api/save-progress', async (req, res) => {
       return res.status(400).json({ error: 'Missing userId' });
     }
     
-    // Check if user has active premium
     const userDoc = await db.collection('users').doc(userId).get();
     const userData = userDoc.data();
     const hasActivePremium = userData.subscription?.hasPaid && 
