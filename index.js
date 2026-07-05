@@ -226,6 +226,7 @@ async function verifyUser(req, res, next) {
     req.userId = decodedToken.uid;
     next();
   } catch (error) {
+    console.error('Token verification failed:', error.message);
     res.status(401).json({ error: 'Unauthorized: Invalid token' });
   }
 }
