@@ -12,10 +12,13 @@ app.use(cors());
 app.use(express.json());
 
 // Initialize Firebase Admin (already set up)
+const fs = require('fs');
+
 if (!admin.apps.length) {
+  const secretPath = '/etc/secrets/service-account-key.json';
+  const serviceAccount = JSON.parse(fs.readFileSync(secretPath, 'utf8'));
   admin.initializeApp({
-    credential: admin.credential.applicationDefault(),
-    projectId: process.env.FIREBASE_PROJECT_ID,
+    credential: admin.credential.cert(serviceAccount)
   });
 }
 const db = admin.firestore();
