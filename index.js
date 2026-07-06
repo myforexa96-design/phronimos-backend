@@ -34,12 +34,28 @@ app.get('/', (req, res) => {
 // VERIFY PAYMENT - SECURE (uses Paystack Secret Key)
 // ============================================================
 app.post('/api/verify-payment', async (req, res) => {
+  // ===== TEMPORARY LOGGING - REMOVE AFTER FIX =====
+  console.log('RAW BODY RECEIVED:', JSON.stringify(req.body));
+  // ================================================
+  
   try {
     const { reference, userId, email, amount } = req.body;
     
+    // Log each field individually
+    console.log('📊 Extracted fields:');
+    console.log('  - reference:', reference);
+    console.log('  - userId:', userId);
+    console.log('  - email:', email);
+    console.log('  - amount:', amount);
+    
     if (!reference || !userId) {
+      console.log('❌ Rejected - Missing required fields:');
+      console.log('  - reference present:', !!reference);
+      console.log('  - userId present:', !!userId);
       return res.status(400).json({ error: 'Missing required fields' });
     }
+    
+    console.log('✅ Validation passed, proceeding to Paystack verification...');
     
     // Verify with Paystack API using SECRET KEY from environment
     const response = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
@@ -50,10 +66,15 @@ app.post('/api/verify-payment', async (req, res) => {
     });
     
     const data = await response.json();
+    console.log('📊 Paystack response status:', data.status);
+    console.log('📊 Paystack data status:', data.data?.status);
     
     if (!data.status || !data.data || data.data.status !== 'success') {
+      console.log('❌ Payment verification failed:', data.message);
       return res.status(400).json({ error: 'Payment verification failed' });
     }
+    
+    console.log('✅ Payment verified successfully!');
     
     // Payment is valid - update Firestore
     const expiryTime = admin.firestore.Timestamp.fromMillis(Date.now() + (24 * 60 * 60 * 1000));
@@ -67,6 +88,8 @@ app.post('/api/verify-payment', async (req, res) => {
       'subscription.amountPaid': amount || 200,
       'updatedAt': admin.firestore.FieldValue.serverTimestamp()
     });
+    
+    console.log(`✅ Subscription activated for user ${userId} until ${new Date(expiryTime.toMillis()).toISOString()}`);
     
     // Also save payment record
     await db.collection('payments').add({
@@ -86,7 +109,7 @@ app.post('/api/verify-payment', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('Payment verification error:', error);
+    console.error('❌ Payment verification error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
