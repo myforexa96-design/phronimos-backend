@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
+const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,16 +13,22 @@ app.use(cors());
 app.use(express.json());
 
 // Initialize Firebase Admin (already set up)
-const fs = require('fs');
-
 if (!admin.apps.length) {
-  const secretPath = '/etc/secrets/service-account-key.json';
-  const serviceAccount = JSON.parse(fs.readFileSync(secretPath, 'utf8'));
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+    credential: admin.credential.applicationDefault(),
+    projectId: process.env.FIREBASE_PROJECT_ID,
   });
 }
 const db = admin.firestore();
+
+// Initialize Google GenAI for Ghanaian & Multilingual TTS
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  apiVersion: 'v1alpha'
+});
+
+// In-memory cache so repeated sentences load in 5ms with 0 API calls
+const ttsCache = new Map();
 
 // ============================================================
 // HEALTH CHECK
@@ -34,28 +41,12 @@ app.get('/', (req, res) => {
 // VERIFY PAYMENT - SECURE (uses Paystack Secret Key)
 // ============================================================
 app.post('/api/verify-payment', async (req, res) => {
-  // ===== TEMPORARY LOGGING - REMOVE AFTER FIX =====
-  console.log('RAW BODY RECEIVED:', JSON.stringify(req.body));
-  // ================================================
-  
   try {
     const { reference, userId, email, amount } = req.body;
     
-    // Log each field individually
-    console.log('📊 Extracted fields:');
-    console.log('  - reference:', reference);
-    console.log('  - userId:', userId);
-    console.log('  - email:', email);
-    console.log('  - amount:', amount);
-    
     if (!reference || !userId) {
-      console.log('❌ Rejected - Missing required fields:');
-      console.log('  - reference present:', !!reference);
-      console.log('  - userId present:', !!userId);
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    
-    console.log('✅ Validation passed, proceeding to Paystack verification...');
     
     // Verify with Paystack API using SECRET KEY from environment
     const response = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
@@ -66,15 +57,10 @@ app.post('/api/verify-payment', async (req, res) => {
     });
     
     const data = await response.json();
-    console.log('📊 Paystack response status:', data.status);
-    console.log('📊 Paystack data status:', data.data?.status);
     
     if (!data.status || !data.data || data.data.status !== 'success') {
-      console.log('❌ Payment verification failed:', data.message);
       return res.status(400).json({ error: 'Payment verification failed' });
     }
-    
-    console.log('✅ Payment verified successfully!');
     
     // Payment is valid - update Firestore
     const expiryTime = admin.firestore.Timestamp.fromMillis(Date.now() + (24 * 60 * 60 * 1000));
@@ -88,8 +74,6 @@ app.post('/api/verify-payment', async (req, res) => {
       'subscription.amountPaid': amount || 200,
       'updatedAt': admin.firestore.FieldValue.serverTimestamp()
     });
-    
-    console.log(`✅ Subscription activated for user ${userId} until ${new Date(expiryTime.toMillis()).toISOString()}`);
     
     // Also save payment record
     await db.collection('payments').add({
@@ -109,7 +93,7 @@ app.post('/api/verify-payment', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('❌ Payment verification error:', error);
+    console.error('Payment verification error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -381,6 +365,78 @@ app.post('/api/synthesize-voice/elevenlabs', verifyUser, async (req, res) => {
   } catch (error) {
     console.error('ElevenLabs Proxy error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================================
+// GEMINI GHANAIAN & MULTILINGUAL TTS (Pastor Eddy & Richel)
+// ============================================================
+app.post('/api/tts', async (req, res) => {
+  try {
+    const { text, language = 'en', teacher = 'Pastor Eddy', gender = 'male' } = req.body;
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'Text parameter is required' });
+    }
+
+    // Cache key based on sentence and teacher
+    const cacheKey = crypto.createHash('md5').update(`${language}_${teacher}_${text.trim()}`).digest('hex');
+    if (ttsCache.has(cacheKey)) {
+      return res.json({ audioBase64: ttsCache.get(cacheKey), mimeType: 'audio/wav', cached: true });
+    }
+
+    const isFemale = teacher === 'Richel' || gender === 'female';
+    const voiceName = isFemale ? 'Kore' : 'Fenrir';
+
+    // Tailor accent & tone for Ghanaian English, Asante Twi, and French
+    let style = '';
+    if (language === 'twi') {
+      style = isFemale
+        ? "Richel: authentic Asante Twi (Akan) female teacher in Ghana. Warm native tonality and patient instructional pronunciation."
+        : "Pastor Eddy: fluent Asante Twi (Akan) male teacher in Ghana. Traditional Ghanaian cadence, clear and articulate male diction.";
+    } else if (language === 'fr') {
+      style = isFemale
+        ? "Richel: fluent, natural French female teacher for West African learners. Clear articulation, warm pedagogical pacing."
+        : "Pastor Eddy: articulate French male teacher. Clear diction and patient instructional cadence.";
+    } else {
+      style = isFemale
+        ? "Richel: warm, articulate Ghanaian English female teacher. Encouraging, natural West African cadence, clear pronunciation."
+        : "Pastor Eddy: warm, friendly Ghanaian English male teacher and educator. Clear, resonant, authoritative classroom instructional voice.";
+    }
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash-lite-tts',
+      contents: [{ role: 'user', parts: [{ text: text.trim(), speechMetadata: { style } }] }],
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName }
+          }
+        }
+      }
+    });
+
+    const audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!audioBase64) {
+      throw new Error('TTS model returned empty audio');
+    }
+
+    // Cache up to 1000 sentences
+    if (ttsCache.size < 1000) {
+      ttsCache.set(cacheKey, audioBase64);
+    }
+
+    return res.json({
+      audioBase64,
+      mimeType: 'audio/wav',
+      teacher,
+      voiceName,
+      cached: false
+    });
+  } catch (err) {
+    console.error('TTS error:', err);
+    res.status(500).json({ error: err.message || 'Speech generation failed' });
   }
 });
 
