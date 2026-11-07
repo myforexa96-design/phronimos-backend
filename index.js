@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
-const { GoogleGenAI } = require('@google/genai');
+const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Initialize Firebase Admin (already set up)
+// Initialize Firebase Admin
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.applicationDefault(),
@@ -21,13 +21,7 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
-// Initialize Google GenAI for Ghanaian & Multilingual TTS
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  apiVersion: 'v1alpha'
-});
-
-// In-memory cache so repeated sentences load in 5ms with 0 API calls
+// In-memory cache so repeated sentences load in < 5ms with zero CPU/network usage
 const ttsCache = new Map();
 
 // ============================================================
@@ -369,7 +363,8 @@ app.post('/api/synthesize-voice/elevenlabs', verifyUser, async (req, res) => {
 });
 
 // ============================================================
-// GEMINI GHANAIAN & MULTILINGUAL TTS (Pastor Eddy & Richel)
+// NATURAL STUDIO TTS (Pastor Eddy & Richel - American Voices)
+// 100% Free • No API Key • No Google Billing • No Quota Limits
 // ============================================================
 app.post('/api/tts', async (req, res) => {
   try {
@@ -379,64 +374,73 @@ app.post('/api/tts', async (req, res) => {
       return res.status(400).json({ error: 'Text parameter is required' });
     }
 
-    // Cache key based on sentence and teacher
-    const cacheKey = crypto.createHash('md5').update(`${language}_${teacher}_${text.trim()}`).digest('hex');
-    if (ttsCache.has(cacheKey)) {
-      return res.json({ audioBase64: ttsCache.get(cacheKey), mimeType: 'audio/wav', cached: true });
-    }
-
+    const cleanText = text.trim();
     const isFemale = teacher === 'Richel' || gender === 'female';
-    const voiceName = isFemale ? 'Kore' : 'Fenrir';
 
-    // Tailor accent & tone for Ghanaian English, Asante Twi, and French
-    let style = '';
-    if (language === 'twi') {
-      style = isFemale
-        ? "Richel: authentic Asante Twi (Akan) female teacher in Ghana. Warm native tonality and patient instructional pronunciation."
-        : "Pastor Eddy: fluent Asante Twi (Akan) male teacher in Ghana. Traditional Ghanaian cadence, clear and articulate male diction.";
-    } else if (language === 'fr') {
-      style = isFemale
-        ? "Richel: fluent, natural French female teacher for West African learners. Clear articulation, warm pedagogical pacing."
-        : "Pastor Eddy: articulate French male teacher. Clear diction and patient instructional cadence.";
+    // American Voices:
+    // Richel: en-US-JennyNeural (Warm, clear, natural American educator)
+    // Pastor Eddy: en-US-GuyNeural (Articulate, resonant, natural American educator)
+    let selectedVoice;
+    if (language === 'fr') {
+      selectedVoice = isFemale ? 'fr-FR-DeniseNeural' : 'fr-FR-HenriNeural';
     } else {
-      style = isFemale
-        ? "Richel: warm, articulate Ghanaian English female teacher. Encouraging, natural West African cadence, clear pronunciation."
-        : "Pastor Eddy: warm, friendly Ghanaian English male teacher and educator. Clear, resonant, authoritative classroom instructional voice.";
+      selectedVoice = isFemale ? 'en-US-JennyNeural' : 'en-US-GuyNeural';
     }
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [{ role: 'user', parts: [{ text: text.trim(), speechMetadata: { style } }] }],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName }
-          }
-        }
-      }
+    // Cache key based on voice and sentence text
+    const cacheKey = crypto
+      .createHash('md5')
+      .update(`${selectedVoice}_${cleanText}`)
+      .digest('hex');
+
+    // Return instant cached MP3 if already spoken before
+    if (ttsCache.has(cacheKey)) {
+      return res.json({
+        audioBase64: ttsCache.get(cacheKey),
+        mimeType: 'audio/mp3',
+        voiceName: selectedVoice,
+        teacher: teacher,
+        cached: true,
+      });
+    }
+
+    // Synthesize studio MP3 audio via Microsoft Edge Neural cloud
+    const tts = new MsEdgeTTS();
+    await tts.setMetadata(selectedVoice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+
+    const { audioStream } = tts.toStream(cleanText);
+    const chunks = [];
+
+    await new Promise((resolve, reject) => {
+      audioStream.on('data', (chunk) => chunks.push(chunk));
+      audioStream.on('end', () => {
+        tts.close();
+        resolve();
+      });
+      audioStream.on('error', (err) => {
+        tts.close();
+        reject(err);
+      });
     });
 
-    const audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!audioBase64) {
-      throw new Error('TTS model returned empty audio');
-    }
+    const audioBuffer = Buffer.concat(chunks);
+    const audioBase64 = audioBuffer.toString('base64');
 
-    // Cache up to 1000 sentences
+    // Store in cache (up to 1,000 sentences to protect memory)
     if (ttsCache.size < 1000) {
       ttsCache.set(cacheKey, audioBase64);
     }
 
     return res.json({
-      audioBase64,
-      mimeType: 'audio/wav',
-      teacher,
-      voiceName,
-      cached: false
+      audioBase64: audioBase64,
+      mimeType: 'audio/mp3',
+      voiceName: selectedVoice,
+      teacher: teacher,
+      cached: false,
     });
   } catch (err) {
-    console.error('TTS error:', err);
-    res.status(500).json({ error: err.message || 'Speech generation failed' });
+    console.error('TTS error on Render:', err);
+    return res.status(500).json({ error: err.message || 'Speech generation failed' });
   }
 });
 
